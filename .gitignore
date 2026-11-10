@@ -1,0 +1,20 @@
+# created by ol-hub-docker.sh - never commit (secrets, per-install settings)
+install.conf
+secrets.env
+.env
+generated/
+*.tmp.*
+# certificates and keys
+certs/*
+!certs/README.md
+# master-licence keys
+*.jwt
+master-license*
+ol-hub-credentials.enc
+# image archives from ./ol-hub-docker.sh save-images (several GB)
+*.tar
+# editor and operating-system files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

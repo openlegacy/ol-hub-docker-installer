@@ -1,0 +1,7 @@
+# Keep Unix line endings in every checkout, also on Windows: bash, Caddy, Keycloak and the containers read
+# these files and break on CRLF.
+* text=auto eol=lf
+# ...except the Windows launcher, which cmd.exe reads
+*.cmd text eol=crlf
+# images are binary: never touch their bytes
+*.ico binary

@@ -1,0 +1,68 @@
+# OpenLegacy Hub - HTTPS entry point. Every component that a browser opens gets its own host name.
+#
+# All {$...} values come from .env (written by ol-hub-docker.sh from install.conf). Inside the Docker network the
+# same host names point at this proxy too (network aliases in docker-compose.yml), so the apps reach Keycloak
+# and the Hub on their public URLs, exactly as the browser does.
+{
+	https_port {$HTTPS_PORT}
+	# the certificate authority stays inside the container; ./ol-hub-docker.sh trust-certificate trusts it on this computer
+	skip_install_trust
+}
+
+# TLS_MODE in install.conf picks one of these three
+(tls_selfsigned) {
+	# certificates signed by the proxy's own local authority (browsers warn until it is trusted)
+	tls internal
+}
+(tls_custom) {
+	# your own certificate: certs/tls.crt (full chain) and certs/tls.key, valid for every host name below
+	tls /certs/tls.crt /certs/tls.key
+}
+(tls_letsencrypt) {
+	# free public certificates: real DNS names, and ports 80 and 443 of this computer reachable from the internet
+	tls {$ACME_EMAIL}
+}
+
+# The Hub shell and every app mounted in it (the Hub's embedded gateway)
+{$PUBLIC_HUB_URL} {
+	import tls_{$TLS_MODE}
+	reverse_proxy ol-hub:8080 {
+		# OL-Spec AI jobs stream their answer with no heartbeat: pass it through unbuffered
+		flush_interval -1
+	}
+}
+
+# Keycloak: the browser signs in here. This URL + /auth/realms/ol-hub is the token issuer the apps check.
+{$PUBLIC_KEYCLOAK_URL} {
+	import tls_{$TLS_MODE}
+	redir / /auth/ 302
+	reverse_proxy hub-enterprise-keycloak:8080 {
+		header_up X-Forwarded-Port {$HTTPS_PORT}
+	}
+}
+
+# Apps with their own address (a standalone page, or a link the browser opens).
+# An app that is not installed answers 502 here; nothing else is affected.
+{$PUBLIC_OL_CODE_URL} {
+	import tls_{$TLS_MODE}
+	reverse_proxy ol-code:9091
+}
+
+{$PUBLIC_OL_TERMINAL_URL} {
+	import tls_{$TLS_MODE}
+	reverse_proxy ol-terminal:9093
+}
+
+{$PUBLIC_OL_DATAIQ_BATCH_URL} {
+	import tls_{$TLS_MODE}
+	reverse_proxy ol-dataiq-batch:8089
+}
+
+# Every app inside the Hub is a page of its own there: https://ol-hub.<domain>/<app>, e.g. /ol-termiq.
+# A short address leads there: https://ol-termiq.<domain> -> https://ol-hub.<domain>/ol-termiq (also /admin etc.).
+# APP_HOST_LABEL says which part of the host name is the app (counted from the right, the domain is 0..n-1).
+{$APP_REDIRECT_URLS} {
+	import tls_{$TLS_MODE}
+	redir / {$PUBLIC_HUB_URL}/{http.request.host.labels.{$APP_HOST_LABEL}} 302
+	redir {$PUBLIC_HUB_URL}/{http.request.host.labels.{$APP_HOST_LABEL}}{uri} 302
+}

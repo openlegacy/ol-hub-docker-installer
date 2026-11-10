@@ -1,0 +1,74 @@
+# OpenLegacy Hub on Docker Compose - settings.
+#
+# You do not have to edit this file: on the first run ./ol-hub-docker.sh asks a few questions and saves the answers
+# to install.conf. To change something later, edit install.conf and run ./ol-hub-docker.sh again.
+# Put values with spaces in double quotes, e.g. TENANT_ORGANIZATION="My Company".
+
+# --- Address --------------------------------------------------------------------------------------------
+# The domain under which every component gets its own address:
+#   https://ol-hub.<domain>  (sign in here)    https://keycloak.<domain>    and for some apps
+#   https://ol-code.<domain>  https://ol-terminal.<domain>  https://ol-dataiq-batch.<domain>
+# Choose one of:
+#   localhost        only this computer can open it; nothing to set up (Chrome, Edge or Firefox)
+#   192.168.1.20     this computer's IP address: the installer turns it into 192.168.1.20.nip.io, a free
+#                    public DNS service that points every <name>.192.168.1.20.nip.io at that IP
+#   ol.example.com   your own domain: your DNS must point *.ol.example.com (or each name) at this computer
+APPS_DOMAIN=localhost
+
+# --- Apps -----------------------------------------------------------------------------------------------
+# Optional apps, space separated. PostgreSQL, Keycloak and the Hub are always installed.
+# Available: ol-integration ol-termiq ol-dataiq ol-dataiq-batch ol-appiq ol-next ol-spec ol-code ol-terminal
+#            ol-coreiq ol-atomiq
+# The apps they need are added automatically (ol-termiq, ol-dataiq, ol-appiq -> ol-integration;
+# ol-dataiq -> ol-dataiq-batch). Apps already installed stay installed: use ./ol-hub-docker.sh remove <app>.
+APPS=""
+
+# --- Tenant and licence ---------------------------------------------------------------------------------
+# REQUIRED: the master licence from OpenLegacy (the .jwt file). The installer does not start without it,
+# asks for it when it is missing, and keeps a copy in this folder as master-license.jwt.
+MASTER_LICENSE_FILE=
+# Organization name of the tenant (also shown in the admin user's token)
+TENANT_ORGANIZATION=OpenLegacy
+# Contact person stored on the tenant (any name or e-mail; default ol-hub)
+TENANT_CONTACT=
+# E-mail of the built-in admin user ol-hub
+HUB_ADMIN_EMAIL=admin@openlegacy.com
+# Tenant id. Leave empty: the default 4a6bfc5d-3bae-45a3-99b9-d1e255875adb is the built-in tenant whose
+# admin (user ol-hub) the Hub and OL-Integration create.
+TENANT_ID=
+
+# --- Ports and certificate ------------------------------------------------------------------------------
+# Ports on this computer. With HTTPS_PORT other than 443 every address gets it, e.g. https://ol-hub.localhost:8443
+HTTPS_PORT=443
+# Plain http: only redirects to https (and answers Let's Encrypt)
+HTTP_PORT=80
+# selfsigned   a certificate made on this computer (browsers warn until you run ./ol-hub-docker.sh trust-certificate)
+# custom       your own certificate: certs/tls.crt (full chain) + certs/tls.key, valid for all the addresses
+# letsencrypt  a free public certificate: needs a real domain, ACME_EMAIL, and ports 80 + 443 open to the internet
+TLS_MODE=selfsigned
+ACME_EMAIL=
+
+# --- Optional overrides (leave empty) -------------------------------------------------------------------
+# Host names (default: ol-hub.<APPS_DOMAIN>, keycloak.<APPS_DOMAIN>, ol-code.<APPS_DOMAIN>, ...)
+HUB_HOST=
+KEYCLOAK_HOST=
+OL_CODE_HOST=
+OL_TERMINAL_HOST=
+OL_DATAIQ_BATCH_HOST=
+# Extra hub-spa redirect URIs, space separated (the addresses above are added automatically)
+EXTRA_REDIRECT_URIS=
+
+# External PostgreSQL 17 instead of the bundled one: set DB_HOST and DB_PASSWORD. The user must be able to
+# create schemas in DB_NAME, and the host must be reachable from the Docker containers.
+DB_HOST=
+DB_PORT=5432
+DB_NAME=postgres
+DB_USER=postgres
+DB_PASSWORD=
+
+# Download the images on every install (false: use images that are already loaded, e.g. with docker load)
+PULL_IMAGES=true
+# Seconds to wait for each component to answer (slow computers: 1800)
+WAIT_TIMEOUT=900
+
+# Image overrides, e.g. IMAGE_OL_INTEGRATION=..., see images.conf

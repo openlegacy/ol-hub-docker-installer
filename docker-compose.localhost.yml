@@ -1,0 +1,29 @@
+# Added on top of docker-compose.yml only when APPS_DOMAIN=localhost (ol-hub-docker.sh sets COMPOSE_FILE in .env).
+#
+# Why: several apps (OL Code, OL Terminal, DataIQ, ...) call Keycloak and the Hub on their PUBLIC addresses,
+# exactly as the browser does. With any other domain those names reach the proxy through its
+# network aliases (Docker's DNS). But the apps' HTTP client (Vert.x/Netty) treats every *.localhost name as
+# "this container" (RFC 6761) before it asks DNS, so https://keycloak.localhost would hit the app itself.
+# A hosts-file entry is read first: it points the names at this computer (host-gateway), where the proxy
+# listens on HTTPS_PORT, exactly like the browser reaches it.
+
+x-localhost-names: &localhost-names
+  - "${HUB_HOST}:host-gateway"
+  - "${KEYCLOAK_HOST}:host-gateway"
+  - "${OL_CODE_HOST}:host-gateway"
+  - "${OL_TERMINAL_HOST}:host-gateway"
+  - "${OL_DATAIQ_BATCH_HOST}:host-gateway"
+
+services:
+  ol-hub:          {extra_hosts: *localhost-names}
+  ol-integration:  {extra_hosts: *localhost-names}
+  ol-dataiq-batch: {extra_hosts: *localhost-names}
+  ol-termiq:       {extra_hosts: *localhost-names}
+  ol-dataiq:       {extra_hosts: *localhost-names}
+  ol-appiq:        {extra_hosts: *localhost-names}
+  ol-next:         {extra_hosts: *localhost-names}
+  ol-spec:         {extra_hosts: *localhost-names}
+  ol-code:         {extra_hosts: *localhost-names}
+  ol-terminal:     {extra_hosts: *localhost-names}
+  ol-coreiq:       {extra_hosts: *localhost-names}
+  ol-atomiq:       {extra_hosts: *localhost-names}

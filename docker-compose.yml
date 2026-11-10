@@ -1,0 +1,602 @@
+# OpenLegacy Hub on Docker Compose
+#
+# Install with ./ol-hub-docker.sh, not with "docker compose up". The installer writes .env (host names, image tags,
+# secrets, selected apps) and generated/hub-apps.env, then starts everything in this order:
+#
+#   postgres -> keycloak (realm ol-hub) -> ol-hub-migrate -> ol-hub -> tenant + admin user (SQL, kcadm)
+#   -> optional apps -> ol-hub again with every app that answers switched on -> master licence
+#
+# After the install, plain docker compose commands work too (docker compose ps / logs / up -d / stop).
+# Optional apps are compose profiles: COMPOSE_PROFILES in .env lists the selected ones.
+# Every ${...} value comes from .env. Container-to-container URLs use the service names and container ports
+# below; browser-facing URLs (PUBLIC_*) go through the proxy service. With APPS_DOMAIN=localhost, .env also
+# adds docker-compose.localhost.yml (COMPOSE_FILE): see the comment there.
+#
+# The comments next to the settings say why a value is set (or must NOT be set) for an app.
+
+name: ol-hub
+
+x-common: &common
+  restart: unless-stopped
+  stop_grace_period: 30s
+  logging:
+    driver: json-file
+    options: {max-size: 50m, max-file: "5"}
+
+# Database connection: the same OL_DB_* variables for the Hub and every app
+x-db-env: &db-env
+  OL_DB_TYPE: postgres
+  OL_DB_HOST: ${OL_DB_HOST}
+  OL_DB_PORT: ${OL_DB_PORT}
+  OL_DB_NAME: ${OL_DB_NAME}
+  OL_DB_USER: ${OL_DB_USER}
+  OL_DB_PASSWORD: ${OL_DB_PASSWORD}
+
+# Every app starts after the Hub. ol-hub-docker.sh switches an app on in the Hub only once it answers.
+x-after-hub: &after-hub
+  ol-hub: {condition: service_started}
+
+# One-shot step before an app that keeps data. The app's volumes are mounted with nocopy (the app starts with
+# empty folders); this step makes them writable for the app, whatever user id its image runs as.
+x-volume-init: &volume-init
+  image: ${IMAGE_PROXY}
+  entrypoint: ["/bin/sh", "-c"]
+  command: ["chmod 0777 /volumes/*"]
+  restart: "no"
+  logging:
+    driver: json-file
+    options: {max-size: 1m, max-file: "1"}
+
+services:
+
+  # --------------------------------------------------------------------------------------------------
+  # HTTPS entry point (Caddy): one address per component; the configuration is config/caddy/Caddyfile.
+  # Its network aliases make the public host names resolve to it inside the Docker network as well.
+  # --------------------------------------------------------------------------------------------------
+  proxy:
+    <<: *common
+    image: ${IMAGE_PROXY}
+    ports:
+      - "${HTTPS_PORT}:${HTTPS_PORT}"
+      - "${HTTPS_PORT}:${HTTPS_PORT}/udp"
+      - "${HTTP_PORT}:80"
+    environment:
+      HTTPS_PORT: ${HTTPS_PORT}
+      TLS_MODE: ${TLS_MODE}
+      ACME_EMAIL: ${ACME_EMAIL}
+      PUBLIC_HUB_URL: ${PUBLIC_HUB_URL}
+      PUBLIC_KEYCLOAK_URL: ${PUBLIC_KEYCLOAK_URL}
+      PUBLIC_OL_CODE_URL: ${PUBLIC_OL_CODE_URL}
+      PUBLIC_OL_TERMINAL_URL: ${PUBLIC_OL_TERMINAL_URL}
+      PUBLIC_OL_DATAIQ_BATCH_URL: ${PUBLIC_OL_DATAIQ_BATCH_URL}
+      APP_REDIRECT_URLS: ${APP_REDIRECT_URLS}
+      APP_HOST_LABEL: ${APP_HOST_LABEL}
+    volumes:
+      - ./config/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./certs:/certs:ro
+      - caddy-data:/data          # the local certificate authority and certificates (keep it: browsers trust it)
+      - caddy-config:/config
+    mem_limit: 256m
+    networks:
+      default:
+        aliases:
+          - ${HUB_HOST}
+          - ${KEYCLOAK_HOST}
+          - ${OL_CODE_HOST}
+          - ${OL_TERMINAL_HOST}
+          - ${OL_DATAIQ_BATCH_HOST}
+
+  # --------------------------------------------------------------------------------------------------
+  # 1. PostgreSQL 17: one database for everything (one schema per app). Not started with an external DB.
+  # --------------------------------------------------------------------------------------------------
+  postgres:
+    <<: *common
+    image: ${IMAGE_POSTGRES}
+    profiles: [bundled-db]
+    stop_grace_period: 60s
+    environment:
+      POSTGRES_USER: ${OL_DB_USER}
+      POSTGRES_PASSWORD: ${OL_DB_PASSWORD}
+      POSTGRES_DB: ${OL_DB_NAME}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./config/postgres/initdb:/docker-entrypoint-initdb.d:ro    # schema keycloak, on the first start
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 30s
+    mem_limit: 2g
+    networks:
+      default:
+        aliases: [hub-enterprise-postgres]   # the default database host of the images
+
+  # --------------------------------------------------------------------------------------------------
+  # 2. Keycloak 26 (openlegacy-keycloak) with realm ol-hub (clients hub-spa, hub-client).
+  #    The realm is imported once, on the first start, from config/keycloak/realm-ol-hub.json. Its
+  #    ${KEYCLOAK_MANAGEMENT_CLIENT_SECRET} and ${HUB_SPA_REDIRECT_URI} placeholders are filled in by Keycloak
+  #    from the environment below. ol-hub-docker.sh then keeps the hub-spa redirect URIs and the admin user in sync.
+  # --------------------------------------------------------------------------------------------------
+  keycloak:
+    <<: *common
+    image: ${IMAGE_KEYCLOAK}
+    command: ["start", "--import-realm"]
+    depends_on:
+      postgres: {condition: service_healthy, required: false}
+    environment:
+      # The image sets KC_HTTP_RELATIVE_PATH=/auth and its own TLS keystore: /auth is served on 8080 (http,
+      # used by the proxy) and on 8443 (https, self-signed, used by the Hub and the apps inside the network).
+      KC_HTTP_ENABLED: "true"
+      KC_HOSTNAME_STRICT: "false"
+      # the proxy terminates TLS and forwards to 8080: trust X-Forwarded-* to build the public https URLs
+      KC_PROXY_HEADERS: xforwarded
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://${OL_DB_HOST}:${OL_DB_PORT}/${OL_DB_NAME}
+      KC_DB_SCHEMA: keycloak
+      KC_DB_USERNAME: ${OL_DB_USER}
+      KC_DB_PASSWORD: ${OL_DB_PASSWORD}
+      # master-realm admin, created on the first start only
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN_USER}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD}
+      # realm import placeholders
+      KEYCLOAK_MANAGEMENT_CLIENT_SECRET: ${KEYCLOAK_MANAGEMENT_CLIENT_SECRET}
+      HUB_SPA_REDIRECT_URI: ${PUBLIC_HUB_URL}/*
+    volumes:
+      - ./config/keycloak/realm-ol-hub.json:/opt/keycloak/data/import/ol-hub.json:ro
+    healthcheck:
+      # ready = realm ol-hub answers (the image has bash but no curl)
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080 && printf 'GET /auth/realms/ol-hub HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n' >&3 && read -r s <&3 && [[ $$s == *' 200 '* ]]"]
+      interval: 10s
+      timeout: 5s
+      retries: 60
+      start_period: 60s
+    mem_limit: 1536m
+    networks:
+      default:
+        aliases: [hub-enterprise-keycloak]   # the Hub and the apps use https://hub-enterprise-keycloak:8443/auth
+
+  # --------------------------------------------------------------------------------------------------
+  # 3. OpenLegacy Hub 4.0.0 with the embedded multi-app gateway (one container: nginx 8080 -> Hub JVM).
+  #    ol-hub-migrate runs the image's "migrate" mode first (Hub schemas); the Hub starts after it.
+  # --------------------------------------------------------------------------------------------------
+  ol-hub-migrate:
+    image: ${IMAGE_HUB}
+    command: ["migrate", ""]
+    restart: "no"
+    logging:
+      driver: json-file
+      options: {max-size: 10m, max-file: "2"}
+    depends_on:
+      postgres: {condition: service_healthy, required: false}
+    environment:
+      <<: *db-env
+    mem_limit: 1g
+
+  ol-hub:
+    <<: *common
+    image: ${IMAGE_HUB}
+    # JVM options are the entrypoint's 2nd argument, e.g.  command: ["", "-Xmx2g"]
+    depends_on:
+      keycloak: {condition: service_healthy}
+      ol-hub-migrate: {condition: service_completed_successfully}
+    # RBAC source + the settings of every app switched on in the Hub (written by ol-hub-docker.sh from config/hub/)
+    env_file:
+      - ./generated/hub-apps.env
+    environment:
+      <<: *db-env
+      HUB_ENVIRONMENT_NAME: onprem
+      OL_HUB_REGION: onprem
+      OL_HUB_URL: ${PUBLIC_HUB_URL}
+      OL_TOKEN_REVOCATION_ENABLED: "false"
+      OL_INTERNAL_SERVICE_SECRET_ENFORCED: "true"
+      # browser login origin (the Hub SPA's authDomain) and the in-network realm for JWKS and admin calls
+      AUTH_DOMAIN: ${PUBLIC_KEYCLOAK_URL}
+      HUB_IAM_URL: https://hub-enterprise-keycloak:8443/auth/realms/ol-hub
+      BACKOFFICE_IAM_URL: https://hub-enterprise-keycloak:8443/auth/realms/ol-hub
+      KEYCLOAK_BASE_URL: https://hub-enterprise-keycloak:8443
+      KEYCLOAK_MANAGEMENT_CLIENT_ID: hub-client
+      # embedded gateway: an app's routes are on only while its <APP>_HOST is set
+      OL_HUB_EMBEDDED_GATEWAY: "true"
+      KEYCLOAK_HOST: hub-enterprise-keycloak
+      KEYCLOAK_PORT: "8443"
+      # secrets (secrets.env; generated once, never rotated in place)
+      OL_HUB_ENCRYPT_SECRET: ${OL_HUB_ENCRYPT_SECRET}
+      OL_HUB_PK_API_KEY_SIGN: ${OL_HUB_PK_API_KEY_SIGN}
+      OL_INTERNAL_SERVICE_SECRET: ${OL_INTERNAL_SERVICE_SECRET}
+      KEYCLOAK_MANAGEMENT_CLIENT_SECRET: ${KEYCLOAK_MANAGEMENT_CLIENT_SECRET}
+    mem_limit: 3g
+
+  # ==================================================================================================
+  # Optional apps (one profile each; an app's profile list also contains the apps that need it)
+  # ==================================================================================================
+
+  # OL-Integration 4.0.0: the product/designer half attached to the Hub.
+  # Serves /backend, /dt-engine, /runtime, /solution-center and the designer remote through the Hub gateway.
+  # Migrates its own schemas on start. Shares the Hub's secrets.
+  ol-integration:
+    <<: *common
+    image: ${IMAGE_OL_INTEGRATION}
+    profiles: [ol-integration, ol-termiq, ol-dataiq, ol-appiq]
+    depends_on: *after-hub
+    environment:
+      <<: *db-env
+      LAUNCHER_CLASS: io.ol.hub.enterprise.consumer.ConsumerLauncherKt
+      MAIN_CLASS: io.ol.hub.enterprise.consumer.ConsumerMainVerticle
+      OL_HUB_URL: ${PUBLIC_HUB_URL}
+      AUTH_DOMAIN: ${PUBLIC_KEYCLOAK_URL}
+      HUB_IAM_URL: https://hub-enterprise-keycloak:8443/auth/realms/ol-hub
+      BACKOFFICE_IAM_URL: https://hub-enterprise-keycloak:8443/auth/realms/ol-hub
+      KEYCLOAK_BASE_URL: https://hub-enterprise-keycloak:8443
+      KEYCLOAK_MANAGEMENT_CLIENT_ID: hub-client
+      AUTH_SERVICE_URL: http://ol-hub:8080/auth-service
+      BACKOFFICE_SERVICE_URL: http://ol-hub:8080/backoffice
+      FLAGS_ROUTER_SERVICE_URL: http://ol-hub:8080/flags-router
+      AUDIT_SERVICE_URL: http://ol-hub:8080/audit
+      OL_AUTH_SERVICE_INTERNAL_URL: http://ol-hub
+      OL_AUTH_SERVICE_INTERNAL_PORT: "9095"
+      OL_FLAGS_ROUTER_INTERNAL_URL: http://ol-hub
+      OL_FLAGS_ROUTER_INTERNAL_PORT: "9096"
+      OL_NOTIFICATIONS_INTERNAL_URL: http://ol-hub
+      OL_NOTIFICATIONS_INTERNAL_PORT: "9097"
+      OL_BACKEND_INTERNAL_PORT: "9095"
+      OL_INTERNAL_SERVICE_SECRET_ENFORCED: "true"
+      OL_RBAC_READ_SOURCE: legacy
+      OL_RBAC_WRITE_SOURCE: legacy
+      OL_TOKEN_REVOCATION_ENABLED: "false"
+      OL_PREMIUM_CLASSIFICATION_MODE: ENFORCE
+      OL_SCREEN_PORT: "1512"
+      OL_INTERNAL_SERVICE_SECRET: ${OL_INTERNAL_SERVICE_SECRET}
+      OL_HUB_ENCRYPT_SECRET: ${OL_HUB_ENCRYPT_SECRET}
+      OL_HUB_PK_API_KEY_SIGN: ${OL_HUB_PK_API_KEY_SIGN}
+      KEYCLOAK_MANAGEMENT_CLIENT_SECRET: ${KEYCLOAK_MANAGEMENT_CLIENT_SECRET}
+    mem_limit: 3g
+
+  # DataIQ batch worker 1.6.7. Called by DataIQ with a shared API key. Spring Batch
+  # metadata goes to schema "batch" (auto-created). It has its own DB variable names. Own address: DataIQ's
+  # "View job" link (the API itself requires the shared key).
+  ol-dataiq-batch:
+    <<: *common
+    image: ${IMAGE_OL_DATAIQ_BATCH}
+    profiles: [ol-dataiq-batch, ol-dataiq]
+    depends_on: *after-hub
+    environment:
+      SERVER_PORT: "8089"
+      BATCH_META_DATASOURCE_URL: jdbc:postgresql://${OL_DB_HOST}:${OL_DB_PORT}/${OL_DB_NAME}
+      BATCH_META_DATASOURCE_USERNAME: ${OL_DB_USER}
+      BATCH_META_DATASOURCE_PASSWORD: ${OL_DB_PASSWORD}
+      BATCH_IMPORT_WRITER_DATASOURCE_URL: jdbc:postgresql://${OL_DB_HOST}:${OL_DB_PORT}/${OL_DB_NAME}?reWriteBatchedInserts=true
+      BATCH_IMPORT_WRITER_DATASOURCE_USERNAME: ${OL_DB_USER}
+      BATCH_IMPORT_WRITER_DATASOURCE_PASSWORD: ${OL_DB_PASSWORD}
+      BATCH_CONTROL_ENABLED: "false"            # the stop endpoint is unauthenticated
+      BATCH_SERVICE_API_KEY: ${DATAIQ_BATCH_API_KEY}
+    mem_limit: 1536m
+    networks:
+      default:
+        aliases: [dataiq-batch]
+
+  # TermIQ. Hub remote /remotes/termiq + /termiq-backend. Migrates termiq_<tenant> on start.
+  ol-termiq:
+    <<: *common
+    image: ${IMAGE_OL_TERMIQ}
+    profiles: [ol-termiq]
+    depends_on:
+      <<: *after-hub
+      ol-integration: {condition: service_started}
+    environment:
+      <<: *db-env
+      WORKING_MODE: HUB_INTEGRATION
+      OL_TERMIQ_MIGRATE_ON_START: "true"
+      OL_HUB_SERVER_PORT: "8094"
+      KEYCLOAK_BASE_URL: https://hub-enterprise-keycloak:8443/auth
+      KEYCLOAK_REALM_NAME: ol-hub
+      KEYCLOAK_CLIENT_ID: hub-spa
+      KEYCLOAK_TRUST_ALL_SSL: "true"
+      AUTH_DOMAIN: ${PUBLIC_KEYCLOAK_URL}
+      OL_MCP_OAUTH_BASE_URL: ${PUBLIC_HUB_URL}/termiq-backend      # MCP through the Hub gateway
+      BACKOFFICE_SERVICE_URL: http://ol-hub:8080/backoffice
+      # OL-Integration, not the Hub (the Hub JVM answers /backend with 501)
+      BACKEND_SERVICE_URL: http://ol-integration:8080/backend
+      OL_INTEGRATION_BASE_URL: http://ol-integration:8080/backend
+      OL_AUTH_SERVICE_INTERNAL_URL: http://ol-hub
+      OL_AUTH_SERVICE_INTERNAL_PORT: "9095"
+      OL_AI_ENABLED_KEY: "false"
+    mem_limit: 2g
+
+  # OL-DataIQ. Hub remote /remotes/dataiq. Needs ol-integration and ol-dataiq-batch.
+  # Its tenant schemas: OL_DB_SCHEMA=dataiq + dataiq_<tenant>. The volume holds the local encryption key and
+  # the operator's JDBC drivers (.dataiq/jars).
+  ol-dataiq-volumes:
+    <<: *volume-init
+    profiles: [ol-dataiq]
+    volumes:
+      - {type: volume, source: ol-dataiq-data, target: /volumes/data}
+
+  ol-dataiq:
+    <<: *common
+    image: ${IMAGE_OL_DATAIQ}
+    profiles: [ol-dataiq]
+    depends_on:
+      <<: *after-hub
+      ol-integration: {condition: service_started}
+      ol-dataiq-batch: {condition: service_started}
+      ol-dataiq-volumes: {condition: service_completed_successfully}
+    environment:
+      <<: *db-env
+      WORKING_MODE: HUB_INTEGRATION
+      OL_DB_SCHEMA: dataiq
+      OL_HUB_BASE_URL: http://ol-hub:8080                           # no path: the licence check calls /backoffice under it
+      # public Keycloak URL, as for ol-code/ol-terminal: DataIQ republishes Keycloak's discovery to MCP
+      # clients, and Keycloak names the issuer after the host it was called on
+      KEYCLOAK_BASE_URL: ${PUBLIC_KEYCLOAK_URL}/auth
+      KEYCLOAK_REALM_NAME: ol-hub
+      KEYCLOAK_CLIENT_ID: hub-spa
+      KEYCLOAK_TRUST_ALL_SSL: "true"
+      AUTH_DOMAIN: ${PUBLIC_KEYCLOAK_URL}
+      OL_MCP_OAUTH_BASE_URL: ${PUBLIC_HUB_URL}/dataiq-backend       # MCP through the Hub gateway
+      BACKOFFICE_SERVICE_URL: http://ol-hub:8080/backoffice
+      BACKEND_SERVICE_URL: http://ol-integration:8080/backend
+      # the batch worker's own address, so DataIQ's "View job" link opens from a browser
+      BATCH_SERVICE_URL: ${PUBLIC_OL_DATAIQ_BATCH_URL}
+      BATCH_SERVICE_API_KEY: ${DATAIQ_BATCH_API_KEY}
+      OL_HUB_DB_ENCRYPTION_SECRET: ${DATAIQ_DB_ENCRYPTION_SECRET}
+    volumes:
+      - {type: volume, source: ol-dataiq-data, target: /usr/app/.dataiq, volume: {nocopy: true}}
+    mem_limit: 2g
+    networks:
+      default:
+        aliases: [dataiq-service]
+
+  # AppIQ. Hub remote /remotes/appiq + /appiq. Needs ol-integration.
+  # Do not set HUB_API_KEY (403 on every /api), OL_PROFILE, WORKING_MODE or KEYCLOAK_* (boot error next to HUB_IAM_URL).
+  ol-appiq:
+    <<: *common
+    image: ${IMAGE_OL_APPIQ}
+    profiles: [ol-appiq]
+    depends_on:
+      <<: *after-hub
+      ol-integration: {condition: service_started}
+    environment:
+      <<: *db-env
+      OL_APPIQ_MIGRATE_ON_START: "true"
+      HUB_IAM_URL: ${PUBLIC_KEYCLOAK_URL}/auth                       # browser-facing; issuer = <this>/realms/ol-hub
+      HUB_IAM_URL_INTERNAL: https://hub-enterprise-keycloak:8443/auth
+      OL_IAM_TLS_TRUST_ALL: "true"
+      OL_HUB_URL: http://ol-hub:8080                                 # the gateway: /backend, /backoffice, /auth-service
+      AUTH_SERVICE_URL: http://ol-hub:8080/auth-service
+      BACKEND_CORS_ORIGINS: "*"
+      JAVA_OPTS: -Xmx1280m -Xms256m
+    mem_limit: 2g
+    networks:
+      default:
+        aliases: [appiq]
+
+  # OL-Next. Hub remote /remotes/ol-next + /ol-next-backend.
+  # The image defaults OL_DB_TYPE=h2 and needs OL_DB_URL for PostgreSQL. HOME is not writable: OL_DATA_DIR.
+  ol-next-volumes:
+    <<: *volume-init
+    profiles: [ol-next]
+    volumes:
+      - {type: volume, source: ol-next-data, target: /volumes/data}
+      - {type: volume, source: ol-next-cache, target: /volumes/cache}
+
+  ol-next:
+    <<: *common
+    image: ${IMAGE_OL_NEXT}
+    profiles: [ol-next]
+    depends_on:
+      <<: *after-hub
+      ol-next-volumes: {condition: service_completed_successfully}
+    environment:
+      <<: *db-env
+      WORKING_MODE: HUB_INTEGRATION
+      OL_POD_URL: http://ol-next:8080
+      OL_HUB_BASE_URL: http://ol-hub:8080
+      KEYCLOAK_BASE_URL: https://hub-enterprise-keycloak:8443/auth
+      KEYCLOAK_ISSUER: ${PUBLIC_KEYCLOAK_URL}/auth/realms/ol-hub
+      KEYCLOAK_REALM_NAME: ol-hub
+      KEYCLOAK_CLIENT_ID: hub-spa
+      KEYCLOAK_TRUST_ALL_SSL: "true"
+      AUTH_DOMAIN: ${PUBLIC_KEYCLOAK_URL}
+      OL_MCP_OAUTH_BASE_URL: ${PUBLIC_HUB_URL}/ol-next-backend      # MCP through the Hub gateway
+      # the five browser-reachable Hub URLs - all five or none
+      OL_HUB_PLATFORM_URL: ${PUBLIC_HUB_URL}
+      OL_HUB_BACKEND_DOMAIN: ${PUBLIC_HUB_URL}/backend
+      OL_HUB_AUTH_SERVICE_URL: ${PUBLIC_HUB_URL}/auth-service
+      OL_HUB_BACKOFFICE_URL: ${PUBLIC_HUB_URL}/backoffice
+      OL_HUB_RUNTIME_SERVICE_URL: ${PUBLIC_HUB_URL}/runtime
+      OL_DB_URL: jdbc:postgresql://${OL_DB_HOST}:${OL_DB_PORT}/${OL_DB_NAME}
+      OL_NEXT_MIGRATE_ON_START: "true"
+      OL_DATA_DIR: /data/ol-next
+      JAVA_OPTS: -Xmx1024m -Xms256m
+    volumes:
+      - {type: volume, source: ol-next-data, target: /data, volume: {nocopy: true}}
+      - {type: volume, source: ol-next-cache, target: /usr/app/.cache, volume: {nocopy: true}}
+    mem_limit: 1536m
+
+  # OL-Spec. Hub remote /remotes/olspec + /olspec-backend (unbuffered).
+  # The volume holds master.key: back it up with the database.
+  # Do not set HUB_IAM_URL (boot fails next to Keycloak), OL_HUB_API_KEY or OL_TOOL_LICENSE.
+  ol-spec-volumes:
+    <<: *volume-init
+    profiles: [ol-spec]
+    volumes:
+      - {type: volume, source: ol-spec-data, target: /volumes/data}
+      - {type: volume, source: ol-spec-cache, target: /volumes/cache}
+
+  ol-spec:
+    <<: *common
+    image: ${IMAGE_OL_SPEC}
+    profiles: [ol-spec]
+    depends_on:
+      <<: *after-hub
+      ol-spec-volumes: {condition: service_completed_successfully}
+    environment:
+      <<: *db-env
+      WORKING_MODE: HUB_INTEGRATION
+      OL_OLSPEC_MIGRATE_ON_START: "true"
+      APP_PORT: "3008"
+      KEYCLOAK_BASE_URL: https://hub-enterprise-keycloak:8443/auth
+      KEYCLOAK_REALM_NAME: ol-hub
+      KEYCLOAK_CLIENT_ID: hub-spa
+      KEYCLOAK_TRUST_ALL_SSL: "true"
+      KEYCLOAK_ISSUER: ${PUBLIC_KEYCLOAK_URL}/auth/realms/ol-hub
+      OL_HUB_BASE_URL: http://ol-hub:8080                           # no path
+      SERVER_MAX_BODY_SIZE: "104857600"
+      BACKEND_CORS_ORIGINS: "*"
+      JAVA_OPTS: -Xmx1536m -Xms256m
+    volumes:
+      - {type: volume, source: ol-spec-data, target: /usr/app/.olspec, volume: {nocopy: true}}
+      - {type: volume, source: ol-spec-cache, target: /usr/app/.cache, volume: {nocopy: true}}
+    mem_limit: 2g
+    networks:
+      default:
+        aliases: [olspec]
+
+  # OL Code. Hub remote /remotes/olcode + its own address for the standalone page.
+  # The volume is the user home (/usr/app: .ol-code and .openlegacy).
+  ol-code-volumes:
+    <<: *volume-init
+    profiles: [ol-code]
+    volumes:
+      - {type: volume, source: ol-code-data, target: /volumes/data}
+
+  ol-code:
+    <<: *common
+    image: ${IMAGE_OL_CODE}
+    profiles: [ol-code]
+    depends_on:
+      <<: *after-hub
+      ol-code-volumes: {condition: service_completed_successfully}
+    environment:
+      <<: *db-env
+      WORKING_MODE: HUB_INTEGRATION
+      OLCODE_MIGRATE_ON_START: "true"
+      OL_HUB_BASE_URL: http://ol-hub:8080
+      KEYCLOAK_BASE_URL: ${PUBLIC_KEYCLOAK_URL}/auth                 # browser-facing (login redirect) and JWKS
+      KEYCLOAK_REALM_NAME: ol-hub
+      KEYCLOAK_CLIENT_ID: hub-spa
+      KEYCLOAK_TRUST_ALL_SSL: "true"
+      OL_MCP_OAUTH_BASE_URL: ${PUBLIC_OL_CODE_URL}                   # MCP on its own address
+      JAVA_TOOL_OPTIONS: -XX:MaxRAMPercentage=75 -XX:+ExitOnOutOfMemoryError   # the entrypoint ignores JAVA_OPTS
+      OL_ADMIN: ${OL_CODE_ADMIN:-admin}
+      OL_PASSWORD: ${OL_CODE_PASSWORD}
+      # 64 hex chars; keep it stable - stored credentials are encrypted with it
+      CREDENTIAL_ENCRYPTION_KEY: ${OL_CODE_CREDENTIAL_ENCRYPTION_KEY}
+    volumes:
+      - {type: volume, source: ol-code-data, target: /usr/app, volume: {nocopy: true}}
+    mem_limit: 2g
+
+  # OL Terminal. Loaded by the Hub shell from its OWN address
+  # (<address>/remoteEntry.json), not through the gateway; hub-spa allows that address (ol-hub-docker.sh adds it).
+  # Do not set OL_HUB_API_KEY or OL_TOOL_LICENSE: the licence is checked per request with the caller's token.
+  ol-terminal-volumes:
+    <<: *volume-init
+    profiles: [ol-terminal]
+    volumes:
+      - {type: volume, source: ol-terminal-traffic, target: /volumes/traffic}
+      - {type: volume, source: ol-terminal-data, target: /volumes/data}
+
+  ol-terminal:
+    <<: *common
+    image: ${IMAGE_OL_TERMINAL}
+    profiles: [ol-terminal]
+    depends_on:
+      <<: *after-hub
+      ol-terminal-volumes: {condition: service_completed_successfully}
+    environment:
+      <<: *db-env
+      WORKING_MODE: HUB_INTEGRATION
+      SERVER_PORT: "9093"
+      OL_TERMINAL_MIGRATE_ON_START: "true"
+      OL_HUB_BASE_URL: http://ol-hub:8080
+      KEYCLOAK_BASE_URL: ${PUBLIC_KEYCLOAK_URL}/auth                 # browser login AND JWKS: resolves to the proxy here too
+      KEYCLOAK_REALM_NAME: ol-hub
+      KEYCLOAK_CLIENT_ID: hub-spa
+      KEYCLOAK_TRUST_ALL_SSL: "true"
+      OL_MCP_OAUTH_BASE_URL: ${PUBLIC_OL_TERMINAL_URL}
+      OL_APP_LOG_LEVEL: INFO
+      JAVA_OPTS: -XX:MaxRAMPercentage=75 -XX:+ExitOnOutOfMemoryError
+      OL_ADMIN: ${OL_TERMINAL_ADMIN}
+      OL_PASSWORD: ${OL_TERMINAL_PASSWORD}
+      CREDENTIAL_ENCRYPTION_KEY: ${OL_TERMINAL_CREDENTIAL_ENCRYPTION_KEY}
+    volumes:
+      - {type: volume, source: ol-terminal-traffic, target: /usr/app/.ol-terminal/traffic, volume: {nocopy: true}}
+      - {type: volume, source: ol-terminal-data, target: /usr/app/data, volume: {nocopy: true}}
+    mem_limit: 2g
+
+  # CoreIQ. Hub remote /remotes/ol-coreiq. Own schema coreiq.
+  # /health is the unauthenticated probe (/api/health answers 401 with Hub sign-in on).
+  # Do not set OL_HUB_IAM_* next to KEYCLOAK_* (they win when set), OL_TOOL_LICENSE or OL_HUB_API_KEY.
+  ol-coreiq:
+    <<: *common
+    image: ${IMAGE_OL_COREIQ}
+    profiles: [ol-coreiq]
+    depends_on: *after-hub
+    environment:
+      <<: *db-env
+      PORT: "8090"
+      KEYCLOAK_BASE_URL: https://hub-enterprise-keycloak:8443/auth
+      KEYCLOAK_REALM_NAME: ol-hub
+      KEYCLOAK_CLIENT_ID: hub-spa
+      KEYCLOAK_TRUST_ALL_SSL: "true"
+      OL_HUB_BACKOFFICE_URL: http://ol-hub:8080/backoffice
+      AUTH_DOMAIN: ${PUBLIC_KEYCLOAK_URL}
+      OL_MCP_BASE_URL: ${PUBLIC_HUB_URL}/coreiq                      # MCP through the Hub gateway
+      OL_DB_SCHEMA: coreiq
+      JAVA_OPTS: -Xmx1024m -Xms256m
+      # unset, the entrypoint generates a random key on every start
+      CREDENTIAL_ENCRYPTION_KEY: ${COREIQ_CREDENTIAL_ENCRYPTION_KEY}
+      ADMIN_PASSKEY: ${COREIQ_ADMIN_PASSKEY}
+      OL_ADMIN: ${COREIQ_ADMIN}
+      OL_PASSWORD: ${COREIQ_PASSWORD}
+    mem_limit: 1536m
+    networks:
+      default:
+        aliases: [coreiq]
+
+  # AtomIQ. Hub remote /remotes/ol-atomiq. Own schema atomiq.
+  # The image defaults OL_DB_TYPE=h2 (OL_DB_TYPE=postgres here). SETTINGS_ENCRYPTION_KEY must be 64 hex chars.
+  ol-atomiq:
+    <<: *common
+    image: ${IMAGE_OL_ATOMIQ}
+    profiles: [ol-atomiq]
+    depends_on: *after-hub
+    environment:
+      <<: *db-env
+      APP_PORT: "8091"
+      KEYCLOAK_BASE_URL: https://hub-enterprise-keycloak:8443/auth
+      KEYCLOAK_REALM_NAME: ol-hub
+      KEYCLOAK_CLIENT_ID: hub-spa
+      KEYCLOAK_TRUST_ALL_SSL: "true"
+      OL_HUB_BACKOFFICE_URL: http://ol-hub:8080/backoffice
+      AUTH_DOMAIN: ${PUBLIC_KEYCLOAK_URL}
+      OL_MCP_BASE_URL: ${PUBLIC_HUB_URL}/atomiq                      # MCP through the Hub gateway
+      OL_DB_SCHEMA: atomiq
+      JAVA_OPTS: -Xmx1024m -Xms256m
+      ADMIN_PASSKEY: ${ATOMIQ_ADMIN_PASSKEY}
+      SETTINGS_ENCRYPTION_KEY: ${ATOMIQ_SETTINGS_ENCRYPTION_KEY}
+      CREDENTIAL_ENCRYPTION_KEY: ${ATOMIQ_CREDENTIAL_ENCRYPTION_KEY}
+    mem_limit: 1536m
+    networks:
+      default:
+        aliases: [atomiq]
+
+networks:
+  default:
+    name: ol-hub-net
+
+# Named volumes keep the data across restarts, upgrades and "./ol-hub-docker.sh uninstall".
+# Only "./ol-hub-docker.sh uninstall --purge" (or "remove <app> --purge") deletes them.
+volumes:
+  postgres-data:
+  caddy-data:
+  caddy-config:
+  ol-dataiq-data:
+  ol-next-data:
+  ol-next-cache:
+  ol-spec-data:
+  ol-spec-cache:
+  ol-code-data:
+  ol-terminal-traffic:
+  ol-terminal-data:
